@@ -4,6 +4,7 @@ import logging
 import os
 import shlex
 import sys
+import datetime
 from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor
 
@@ -12,6 +13,8 @@ from TM1py import TM1Service
 APPNAME = "RushTI"
 LOGFILE = "{current_directory}/RushTI.log".format(current_directory=sys.path[0])
 CONFIG = "{current_directory}/config.ini".format(current_directory=sys.path[0])
+
+start = datetime.datetime.now()
 
 logging.basicConfig(
     filename=LOGFILE,
@@ -179,4 +182,5 @@ if __name__ == "__main__":
     finally:
         logout(tm1_services)
         loop.close()
-    logging.info("{app_name} ends".format(app_name=APPNAME))
+    end = datetime.datetime.now()    
+    logging.info(("{app_name} ends with the duration "+str(end-start)).format(app_name=APPNAME))
