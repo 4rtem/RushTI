@@ -9,6 +9,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 from TM1py import TM1Service
 
+#Set Current directory to the script path.
+abspath = os.path.abspath(__file__)
+dname = os.path.dirname(abspath)
+os.chdir(dname)
+
 APPNAME = "RushTI"
 LOGFILE = "{current_directory}/RushTI.log".format(current_directory=sys.path[0])
 CONFIG = "{current_directory}/config.ini".format(current_directory=sys.path[0])
