@@ -1,0 +1,518 @@
+"""Unit tests for TM1 build module.
+
+Tests the tm1_build module which creates TM1 objects required for RushTI
+logging including dimensions, cubes, views, and sample data.
+"""
+
+import unittest
+from unittest.mock import Mock, patch
+
+from rushti.tm1_objects import (
+    MEASURE_ELEMENTS,
+    MEASURE_ATTRIBUTES,
+    PROCESS_DATA,
+    PROCESS_DATASOURCE,
+    PROCESS_METADATA,
+    PROCESS_PROLOG_V11,
+    PROCESS_PROLOG_V12,
+    PROCESS_VARIABLES,
+    TASK_ID_ELEMENT_COUNT,
+    WORKFLOW_SEED_ELEMENTS,
+    RUN_ID_SEED_ELEMENTS,
+    SAMPLE_DATA,
+)
+from rushti.tm1_build import (
+    build_logging_objects,
+    get_build_status,
+    verify_logging_objects,
+    _create_workflow_dimension,
+    _create_task_id_dimension,
+    _create_run_id_dimension,
+    _create_measure_dimension,
+    _create_process,
+    _merge_measure_dimension_elements,
+)
+
+# Default dimension and cube names for testing
+DIM_TASKFILE = "rushti_workflow"
+DIM_TASK = "rushti_task_id"
+DIM_RUN = "rushti_run_id"
+DIM_MEASURE = "rushti_measure"
+CUBE_LOGS = "rushti"
+
+
+class TestTM1ObjectsConstants(unittest.TestCase):
+    """Tests for tm1_objects module constants."""
+
+    def test_measure_elements_complete(self):
+        """Test that all required measures are defined."""
+        required_measures = [
+            "instance",
+            "process",
+            "parameters",
+            "status",
+            "start_time",
+            "end_time",
+            "duration_seconds",
+            "retries",
+            "retry_count",
+            "error_message",
+            "predecessors",
+            "stage",
+            "safe_retry",
+            "timeout",
+            "cancel_at_timeout",
+            "require_predecessor_success",
+            "succeed_on_minor_errors",
+            "wait",
+            "original_task_id",
+        ]
+        for measure in required_measures:
+            self.assertIn(measure, MEASURE_ELEMENTS)
+
+    def test_original_task_id_is_results_only_measure(self):
+        """original_task_id is a results-only measure (cube output, not input)."""
+        attrs = MEASURE_ATTRIBUTES["original_task_id"]
+        self.assertEqual(attrs["inputs"], "")
+        self.assertEqual(attrs["results"], "Y")
+
+    def test_measure_attributes_match_elements(self):
+        """Test that every measure element has an attribute entry."""
+        for elem in MEASURE_ELEMENTS:
+            self.assertIn(elem, MEASURE_ATTRIBUTES)
+
+    def test_measure_attributes_have_valid_flags(self):
+        """Test that attribute flags are 'Y' or ''."""
+        for elem, attrs in MEASURE_ATTRIBUTES.items():
+            self.assertIn(attrs["inputs"], ("Y", ""))
+            self.assertIn(attrs["results"], ("Y", ""))
+
+    def test_task_id_element_count(self):
+        """Test task ID dimension generates 5000 elements."""
+        self.assertEqual(TASK_ID_ELEMENT_COUNT, 5000)
+
+    def test_sample_data_has_both_modes(self):
+        """Test sample data includes both stage and optimal mode."""
+        self.assertIn("Sample_Optimal_Mode", SAMPLE_DATA)
+        self.assertIn("Sample_Stage_Mode", SAMPLE_DATA)
+
+    def test_sample_data_records_have_required_keys(self):
+        """Test all sample data records have the expected keys."""
+        for workflow, records in SAMPLE_DATA.items():
+            for record in records:
+                self.assertIn("workflow", record)
+                self.assertIn("task_id", record)
+                self.assertIn("run_id", record)
+                self.assertIn("measure", record)
+                self.assertIn("value", record)
+
+
+class TestLoadResultsHeaderValidation(unittest.TestCase):
+    """Guards the }rushti.load.results header-validation contract (issue #169).
+
+    The loader maps CSV columns to process variables positionally. A process
+    built by an older rushti silently wrote values to the wrong measures after
+    a column was added. These tests lock in the metadata-tab header check that
+    turns such drift into a hard error.
+    """
+
+    def test_datasource_reads_header_as_data(self):
+        """Header row must reach the tabs (records=0) so it can be validated."""
+        self.assertEqual(PROCESS_DATASOURCE["asciiHeaderRecords"], 0)
+
+    def test_prologs_read_header_as_data_and_seed_skip_flags(self):
+        """Both prolog variants set records=0 and init the header-skip flags."""
+        for prolog in (PROCESS_PROLOG_V11, PROCESS_PROLOG_V12):
+            self.assertIn("DatasourceASCIIHeaderRecords = 0;", prolog)
+            self.assertNotIn("DatasourceASCIIHeaderRecords = 1;", prolog)
+            self.assertIn("nHeaderChecked", prolog)
+            self.assertIn("nDataHeaderChecked", prolog)
+
+    def test_metadata_validates_every_expected_column(self):
+        """Every CSV column is checked against the variable that feeds it.
+
+        Generated from PROCESS_VARIABLES, so adding a column without updating
+        the loader keeps the check and the CSV contract in lockstep.
+        """
+        for var in PROCESS_VARIABLES:
+            column = var[1:]  # strip the leading 'v'
+            self.assertIn(f"If( {var} @<> '{column}' );", PROCESS_METADATA)
+
+    def test_metadata_fails_loud_and_skips_header(self):
+        """On mismatch the process quits; the header itself is never loaded."""
+        self.assertIn("If( nHeaderChecked = 0 );", PROCESS_METADATA)
+        self.assertIn("ProcessQuit;", PROCESS_METADATA)
+        self.assertIn("ItemSkip;", PROCESS_METADATA)
+        self.assertIn("rushti build --tm1-instance", PROCESS_METADATA)
+
+    def test_data_tab_skips_header_row(self):
+        """The data tab drops the header record so it is not written to cube."""
+        self.assertIn("If( nDataHeaderChecked = 0 );", PROCESS_DATA)
+        self.assertIn("ItemSkip;", PROCESS_DATA)
+
+
+class TestDimensionBuilders(unittest.TestCase):
+    """Tests for dimension builder functions."""
+
+    def test_workflow_dimension(self):
+        """Test workflow dimension has seed elements."""
+        dim = _create_workflow_dimension("rushti_workflow")
+        self.assertEqual(dim.name, "rushti_workflow")
+        hierarchy = dim.hierarchies[0]
+        element_names = [e.name for e in hierarchy.elements.values()]
+        for seed in WORKFLOW_SEED_ELEMENTS:
+            self.assertIn(seed, element_names)
+
+    def test_task_id_dimension(self):
+        """Test task ID dimension has 5000 elements."""
+        dim = _create_task_id_dimension("rushti_task_id")
+        self.assertEqual(dim.name, "rushti_task_id")
+        hierarchy = dim.hierarchies[0]
+        self.assertEqual(len(hierarchy.elements), TASK_ID_ELEMENT_COUNT)
+        # First and last
+        element_names = [e.name for e in hierarchy.elements.values()]
+        self.assertIn("1", element_names)
+        self.assertIn("5000", element_names)
+
+    def test_run_id_dimension(self):
+        """Test run ID dimension has seed elements."""
+        dim = _create_run_id_dimension("rushti_run_id")
+        self.assertEqual(dim.name, "rushti_run_id")
+        hierarchy = dim.hierarchies[0]
+        element_names = [e.name for e in hierarchy.elements.values()]
+        for seed in RUN_ID_SEED_ELEMENTS:
+            self.assertIn(seed, element_names)
+
+    def test_measure_dimension(self):
+        """Test measure dimension has all elements and attributes."""
+        dim = _create_measure_dimension("rushti_measure")
+        self.assertEqual(dim.name, "rushti_measure")
+        hierarchy = dim.hierarchies[0]
+        element_names = [e.name for e in hierarchy.elements.values()]
+        for elem in MEASURE_ELEMENTS:
+            self.assertIn(elem, element_names)
+        # Check attributes defined
+        attr_names = [a.name for a in hierarchy.element_attributes]
+        self.assertIn("inputs", attr_names)
+        self.assertIn("results", attr_names)
+
+    def test_custom_dimension_name(self):
+        """Test that custom dimension names are respected."""
+        dim = _create_workflow_dimension("my_custom_dim")
+        self.assertEqual(dim.name, "my_custom_dim")
+        self.assertEqual(dim.hierarchies[0].name, "my_custom_dim")
+
+
+class TestVerifyLoggingObjects(unittest.TestCase):
+    """Tests for verify_logging_objects function."""
+
+    def test_verify_all_exist(self):
+        """Test verification when all objects exist."""
+        mock_tm1 = Mock()
+        mock_tm1.dimensions.exists.return_value = True
+        mock_tm1.cubes.exists.return_value = True
+
+        result = verify_logging_objects(mock_tm1)
+
+        self.assertTrue(result[DIM_TASKFILE])
+        self.assertTrue(result[DIM_TASK])
+        self.assertTrue(result[DIM_RUN])
+        self.assertTrue(result[DIM_MEASURE])
+        self.assertTrue(result[CUBE_LOGS])
+
+    def test_verify_some_missing(self):
+        """Test verification when some objects are missing."""
+        mock_tm1 = Mock()
+
+        def exists_side_effect(name):
+            return name != DIM_TASKFILE
+
+        mock_tm1.dimensions.exists.side_effect = exists_side_effect
+        mock_tm1.cubes.exists.return_value = True
+
+        result = verify_logging_objects(mock_tm1)
+
+        self.assertFalse(result[DIM_TASKFILE])
+        self.assertTrue(result[DIM_TASK])
+        self.assertTrue(result[CUBE_LOGS])
+
+
+class TestMergeMeasureDimensionElements(unittest.TestCase):
+    """Non-destructive upgrade: add only missing elements + their attribute values."""
+
+    def test_no_op_when_dimension_already_complete(self):
+        mock_tm1 = Mock()
+        mock_tm1.elements.get_element_names.return_value = list(MEASURE_ELEMENTS)
+
+        added = _merge_measure_dimension_elements(mock_tm1, DIM_MEASURE)
+
+        self.assertEqual(added, 0)
+        mock_tm1.elements.create.assert_not_called()
+        mock_tm1.cells.write_values.assert_not_called()
+
+    def test_adds_only_missing_elements(self):
+        # Simulate a 2.x model: all current elements except the new
+        # ``original_task_id``.
+        legacy = [e for e in MEASURE_ELEMENTS if e != "original_task_id"]
+        mock_tm1 = Mock()
+        mock_tm1.elements.get_element_names.return_value = legacy
+
+        added = _merge_measure_dimension_elements(mock_tm1, DIM_MEASURE)
+
+        self.assertEqual(added, 1)
+        # One create call for the missing element only.
+        self.assertEqual(mock_tm1.elements.create.call_count, 1)
+        kwargs = mock_tm1.elements.create.call_args.kwargs
+        self.assertEqual(kwargs["dimension_name"], DIM_MEASURE)
+        self.assertEqual(kwargs["hierarchy_name"], DIM_MEASURE)
+        self.assertEqual(kwargs["element"].name, "original_task_id")
+
+    def test_writes_attributes_only_for_new_elements(self):
+        legacy = [e for e in MEASURE_ELEMENTS if e != "original_task_id"]
+        mock_tm1 = Mock()
+        mock_tm1.elements.get_element_names.return_value = legacy
+
+        _merge_measure_dimension_elements(mock_tm1, DIM_MEASURE)
+
+        # Single write_values call carrying only the new element's attribute(s).
+        mock_tm1.cells.write_values.assert_called_once()
+        cube_arg, cellset = mock_tm1.cells.write_values.call_args.args
+        self.assertEqual(cube_arg, f"}}ElementAttributes_{DIM_MEASURE}")
+        # original_task_id is results-only; the cellset must contain that and
+        # no entries for any other element.
+        keys = set(cellset.keys())
+        self.assertEqual(keys, {("original_task_id", "results")})
+
+
+class TestProcessAlwaysOverwrites(unittest.TestCase):
+    """The TI process is application-owned — every build replaces it."""
+
+    def test_existing_process_is_replaced(self):
+        mock_tm1 = Mock()
+        mock_tm1.version = "11.8.02200.2"
+        mock_tm1.processes.exists.return_value = True
+
+        result = _create_process(mock_tm1, "}rushti.load.results", force=False)
+
+        # Without force=True, the legacy code returned False; the new contract
+        # says the live TI is always replaced and the function always returns True.
+        self.assertTrue(result)
+        mock_tm1.processes.delete.assert_called_once_with("}rushti.load.results")
+        mock_tm1.processes.create.assert_called_once()
+
+    def test_missing_process_is_created(self):
+        mock_tm1 = Mock()
+        mock_tm1.version = "11.8.02200.2"
+        mock_tm1.processes.exists.return_value = False
+
+        result = _create_process(mock_tm1, "}rushti.load.results", force=False)
+
+        self.assertTrue(result)
+        mock_tm1.processes.delete.assert_not_called()
+        mock_tm1.processes.create.assert_called_once()
+
+
+class TestProcessBodyVersionSelection(unittest.TestCase):
+    """_create_process picks v11 vs v12 body based on TM1Service.version."""
+
+    # Symbols that must not appear in a v12 body — they're removed/unsupported.
+    V12_FORBIDDEN = ("CubeGetLogChanges", "CubeSetLogChanges", "ExecuteCommand")
+
+    def _build_against(self, version: str):
+        mock_tm1 = Mock()
+        mock_tm1.version = version
+        mock_tm1.processes.exists.return_value = False
+
+        _create_process(mock_tm1, "}rushti.load.results", force=False)
+
+        process = mock_tm1.processes.create.call_args.args[0]
+        return process
+
+    def test_v11_body_keeps_legacy_calls(self):
+        process = self._build_against("11.8.02200.2")
+        prolog = process.prolog_procedure
+        epilog = process.epilog_procedure
+
+        self.assertIn("CubeGetLogChanges", prolog)
+        self.assertIn("CubeSetLogChanges", prolog)
+        self.assertIn("ExecuteCommand", epilog)
+        self.assertIn("CubeSetLogChanges", epilog)
+        self.assertNotIn("ASCIIDelete", epilog)
+
+    def test_v12_body_drops_forbidden_calls_and_uses_asciidelete(self):
+        process = self._build_against("12.2.5")
+        body = process.prolog_procedure + process.epilog_procedure
+
+        for symbol in self.V12_FORBIDDEN:
+            self.assertNotIn(
+                symbol,
+                body,
+                f"{symbol} must not appear in the v12 TI body",
+            )
+        self.assertIn("ASCIIDelete(pSourceFile)", process.epilog_procedure)
+
+    def test_v12_epilog_still_honours_delete_flag(self):
+        process = self._build_against("12.2.5")
+        epilog = process.epilog_procedure
+
+        # Cleanup remains guarded by pDeleteSourceFile so callers passing 0 keep the file.
+        self.assertIn("pDeleteSourceFile=1", epilog)
+        self.assertIn("ASCIIDelete(pSourceFile)", epilog)
+
+
+class TestBuildLoggingObjectsUpgradePath(unittest.TestCase):
+    """build_logging_objects routes the measure dim through the merge helper."""
+
+    def test_measure_dim_existing_triggers_merge(self):
+        # Dim exists → measure dim should be additively merged, not skipped.
+        legacy = [e for e in MEASURE_ELEMENTS if e != "original_task_id"]
+
+        mock_tm1 = Mock()
+        mock_tm1.dimensions.exists.return_value = True
+        mock_tm1.cubes.exists.return_value = True
+        mock_tm1.processes.exists.return_value = True
+        mock_tm1.subsets.exists.return_value = True
+        mock_tm1.cubes.views.exists.return_value = True
+        mock_tm1.elements.get_element_names.return_value = legacy
+
+        build_logging_objects(mock_tm1, force=False)
+
+        # Merge helper landed → at least one elements.create call for the
+        # missing element, and no destructive dimension recreate.
+        self.assertGreaterEqual(mock_tm1.elements.create.call_count, 1)
+        mock_tm1.dimensions.update_or_create.assert_not_called()
+
+
+class TestGetBuildStatus(unittest.TestCase):
+    """Tests for get_build_status function."""
+
+    def test_status_all_present(self):
+        """Test status message when all objects present."""
+        mock_tm1 = Mock()
+        mock_tm1.dimensions.exists.return_value = True
+        mock_tm1.cubes.exists.return_value = True
+
+        status = get_build_status(mock_tm1)
+
+        self.assertIn("All RushTI logging objects are present", status)
+
+    def test_status_some_missing(self):
+        """Test status message when some objects missing."""
+        mock_tm1 = Mock()
+
+        def exists_side_effect(name):
+            return name != DIM_TASKFILE
+
+        mock_tm1.dimensions.exists.side_effect = exists_side_effect
+        mock_tm1.cubes.exists.return_value = True
+
+        status = get_build_status(mock_tm1)
+
+        self.assertIn("Missing:", status)
+        self.assertIn(DIM_TASKFILE, status)
+
+
+class TestBuildLoggingObjects(unittest.TestCase):
+    """Tests for build_logging_objects function."""
+
+    @patch("rushti.tm1_build._populate_sample_data")
+    @patch("rushti.tm1_build._create_process")
+    @patch("rushti.tm1_build._create_mdx_views")
+    @patch("rushti.tm1_build._create_mdx_subsets")
+    @patch("rushti.tm1_build._create_cube")
+    @patch("rushti.tm1_build._create_dimension")
+    def test_build_all_objects(
+        self,
+        mock_create_dim,
+        mock_create_cube,
+        mock_create_subsets,
+        mock_create_views,
+        mock_create_process,
+        mock_populate,
+    ):
+        """Test building all logging objects."""
+        mock_create_dim.return_value = True
+        mock_create_cube.return_value = True
+        mock_create_subsets.return_value = {
+            "rushti_inputs_opt": True,
+            "rushti_inputs_norm": True,
+            "rushti_results": True,
+        }
+        mock_create_views.return_value = {
+            "Sample_Normal_Mode": True,
+            "Sample_Optimal_Mode": True,
+        }
+        mock_create_process.return_value = True
+        mock_populate.return_value = {"Sample_Stage_Mode": 8, "Sample_Optimal_Mode": 7}
+
+        mock_tm1 = Mock()
+        results = build_logging_objects(mock_tm1, force=False)
+
+        # 4 dimensions created
+        self.assertEqual(mock_create_dim.call_count, 4)
+
+        # Cube, subsets, views, process, sample data all called
+        mock_create_cube.assert_called_once()
+        mock_create_subsets.assert_called_once()
+        mock_create_views.assert_called_once()
+        mock_create_process.assert_called_once()
+        mock_populate.assert_called_once()
+
+        # All results True
+        self.assertTrue(results[DIM_TASKFILE])
+        self.assertTrue(results[DIM_TASK])
+        self.assertTrue(results[DIM_RUN])
+        self.assertTrue(results[DIM_MEASURE])
+        self.assertTrue(results[CUBE_LOGS])
+
+    @patch("rushti.tm1_build._populate_sample_data")
+    @patch("rushti.tm1_build._create_process")
+    @patch("rushti.tm1_build._create_mdx_views")
+    @patch("rushti.tm1_build._create_mdx_subsets")
+    @patch("rushti.tm1_build._create_cube")
+    @patch("rushti.tm1_build._create_dimension")
+    def test_build_handles_dimension_error(
+        self,
+        mock_create_dim,
+        mock_create_cube,
+        mock_create_subsets,
+        mock_create_views,
+        mock_create_process,
+        mock_populate,
+    ):
+        """Test building handles errors gracefully."""
+        call_count = 0
+
+        def dimension_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise Exception("Creation failed")
+            return True
+
+        mock_create_dim.side_effect = dimension_side_effect
+        mock_create_cube.return_value = True
+        mock_create_subsets.return_value = {
+            "rushti_inputs_opt": True,
+            "rushti_inputs_norm": True,
+            "rushti_results": True,
+        }
+        mock_create_views.return_value = {
+            "Sample_Normal_Mode": True,
+            "Sample_Optimal_Mode": True,
+        }
+        mock_create_process.return_value = True
+        mock_populate.return_value = {}
+
+        mock_tm1 = Mock()
+        results = build_logging_objects(mock_tm1)
+
+        # First dimension (workflow) failed
+        self.assertFalse(results[DIM_TASKFILE])
+        # Others succeeded
+        self.assertTrue(results[DIM_TASK])
+        self.assertTrue(results[CUBE_LOGS])
+
+
+if __name__ == "__main__":
+    unittest.main()

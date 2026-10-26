@@ -1,0 +1,1046 @@
+"""
+RushTI task execution engine.
+
+This module contains the core execution logic for running TM1 processes,
+including:
+- TM1 service setup and connection management
+- Process execution with retry and timeout support
+- DAG-based task scheduling with parallel workers
+- Task validation against TM1 server metadata
+- Structured execution logging and statistics collection
+"""
+
+import asyncio
+import configparser
+import dataclasses
+import functools
+import logging
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+from TM1py import TM1Service
+from TM1py.Exceptions import TM1pyTimeout
+from TM1py.Objects import Chore
+
+from rushti.task import Task, OptimizedTask
+from rushti.dag import DAG
+from rushti.tm1_integration import resolve_tm1_params
+from rushti.messages import (
+    MSG_PROCESS_EXECUTE,
+    MSG_PROCESS_SUCCESS,
+    MSG_PROCESS_FAIL_INSTANCE_NOT_IN_CONFIG_FILE,
+    MSG_PROCESS_FAIL_WITH_ERROR_FILE,
+    MSG_PROCESS_HAS_MINOR_ERRORS,
+    MSG_PROCESS_FAIL_UNEXPECTED,
+    MSG_PROCESS_ABORTED_FAILED_PREDECESSOR,
+    MSG_PROCESS_ABORTED_UNCOMPLETE_PREDECESSOR,
+    MSG_PROCESS_NOT_EXISTS,
+    MSG_PROCESS_PARAMS_INCORRECT,
+    MSG_PROCESS_TIMEOUT,
+    MSG_CHORE_EXECUTE,
+    MSG_CHORE_SUCCESS,
+    MSG_CHORE_FAIL,
+    MSG_CHORE_NOT_EXISTS,
+    MSG_CHORE_REQUIRES_SINGLE_COMMIT,
+)
+from rushti.parsing import get_instances_from_tasks_file
+from rushti.exclusive import build_session_context
+
+if TYPE_CHECKING:
+    from rushti.checkpoint import CheckpointManager
+    from rushti.optimizer import TaskOptimizer
+
+APP_NAME = "RushTI"
+
+logger = logging.getLogger()
+
+
+@dataclasses.dataclass
+class ExecutionContext:
+    """Bundles the mutable per-run state that was previously stored as module globals.
+
+    Created by ``cli.main()`` before each run and threaded through to every
+    function that needs it, making execution fully re-entrant.
+    """
+
+    #: Structured execution logger (ExecutionLogger or None)
+    execution_logger: Optional[object] = None
+    #: Statistics database (StatsRepository or None)
+    stats_db: Optional[object] = None
+    #: Lock protecting ``stats_data`` list
+    stats_data_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    #: Collected task stats for batch write at end of run
+    stats_data: list = dataclasses.field(default_factory=list)
+    #: Execution results per task id (for predecessor checking)
+    task_execution_results: dict = dataclasses.field(default_factory=dict)
+    #: Outcome of every task finished so far, in completion order
+    task_outcomes: list = dataclasses.field(default_factory=list)
+    #: Set when a run phase went past its time limit: no new task is started
+    hung: threading.Event = dataclasses.field(default_factory=threading.Event)
+
+
+def _collect_task_stats(
+    ctx: ExecutionContext,
+    task: Task,
+    success: bool,
+    start_time: datetime,
+    end_time: datetime,
+    retry_count: int = 0,
+    error_message: Optional[str] = None,
+) -> None:
+    """Collect task execution stats for batch write at end of run.
+
+    Thread-safe collection of task statistics into ctx.stats_data list.
+    Called after each task completes (success or failure).
+
+    :param ctx: The current execution context
+    :param task: The executed task
+    :param success: Whether the task succeeded
+    :param start_time: Task start timestamp
+    :param end_time: Task end timestamp
+    :param retry_count: Number of retries performed
+    :param error_message: Error message if task failed
+    """
+    if not ctx.stats_db or not ctx.stats_db.enabled:
+        return
+
+    with ctx.stats_data_lock:
+        # ``process`` is NOT NULL in SQLite; chore tasks write the empty
+        # string so the column constraint stays satisfied without making
+        # it nullable. The kind is unambiguous: rows with a non-empty
+        # ``chore`` are chore tasks, rows without are processes.
+        stats_entry = {
+            "run_id": ctx.execution_logger.run_id if ctx.execution_logger else "",
+            "workflow": ctx.execution_logger.workflow if ctx.execution_logger else None,
+            "task_id": task.id,
+            "instance": task.instance_name,
+            "process": task.process_name or "",
+            "chore": getattr(task, "chore_name", None),
+            "parameters": task.parameters if isinstance(task.parameters, dict) else {},
+            "success": success,
+            "start_time": start_time,
+            "end_time": end_time,
+            "retry_count": retry_count,
+            "predecessors": getattr(task, "predecessors", None),
+            "stage": getattr(task, "stage", None),
+            "safe_retry": getattr(task, "safe_retry", None),
+            "timeout": getattr(task, "timeout", None),
+            "cancel_at_timeout": getattr(task, "cancel_at_timeout", None),
+            "require_predecessor_success": getattr(task, "require_predecessor_success", None),
+            "succeed_on_minor_errors": getattr(task, "succeed_on_minor_errors", None),
+        }
+        if error_message:
+            stats_entry["error_message"] = error_message
+        ctx.stats_data.append(stats_entry)
+
+
+def setup_tm1_services(
+    max_workers: int,
+    tasks_file_path: Optional[str] = None,
+    workflow: str = "",
+    exclusive: bool = False,
+    config_path: Optional[str] = None,
+    tm1_instances: Optional[set] = None,
+    tm1_services: Optional[dict] = None,
+    tm1_preserve_connections: Optional[dict] = None,
+) -> Tuple[dict, dict]:
+    """Return Dictionary with TM1ServerName (as in config.ini) : Instantiated TM1Service
+
+    :param max_workers: Maximum number of parallel workers (used for connection pool size)
+    :param tasks_file_path: Path to the tasks file (can be None if tm1_instances provided)
+    :param workflow: Workflow identifier for session context
+    :param exclusive: Whether running in exclusive mode
+    :param config_path: Path to config.ini file (resolved by the caller; required)
+    :param tm1_instances: Optional set of TM1 instance names (used when reading from TM1)
+    :param tm1_services: Optional dict to fill in place, so a caller can see the
+        sessions opened so far while a later login is still blocked
+    :param tm1_preserve_connections: Optional dict to fill in place, as above
+    :return: Dictionary server_names and TM1py.TM1Service instances pairs
+    """
+    if config_path is None:
+        raise ValueError("config_path is required")
+
+    config_file = config_path
+    if not os.path.isfile(config_file):
+        raise ValueError("{config} does not exist".format(config=config_file))
+
+    # Use provided instances or extract from file
+    if tm1_instances is not None:
+        tm1_instances_in_tasks = tm1_instances
+    elif tasks_file_path is not None:
+        tm1_instances_in_tasks = get_instances_from_tasks_file(tasks_file_path)
+    else:
+        raise ValueError("Either tm1_instances or tasks_file_path must be provided")
+    tm1_preserve_connections = {} if tm1_preserve_connections is None else tm1_preserve_connections
+    tm1_services = {} if tm1_services is None else tm1_services
+
+    # Build session context for RushTI identification
+    session_context = build_session_context(workflow, exclusive)
+
+    # parse .ini
+    config = configparser.ConfigParser()
+    config.read(config_file, encoding="utf-8")
+    # build tm1_services dictionary
+    for tm1_server_name, params in config.items():
+        if tm1_server_name not in tm1_instances_in_tasks:
+            continue
+
+        # handle default values from configparser
+        if tm1_server_name != config.default_section:
+            try:
+                connection_file = config.get(tm1_server_name, "connection_file", fallback=None)
+
+                # restore connection from file. In practice faster than creating a new one
+                if connection_file:
+                    tm1_preserve_connections[tm1_server_name] = True
+                    try:
+                        connection_file_path = Path(__file__).parent.parent.parent / connection_file
+                        tm1_services[tm1_server_name] = TM1Service.restore_from_file(
+                            file_name=connection_file_path
+                        )
+
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to restore connection from file. Error: {error}".format(
+                                error=str(e)
+                            )
+                        )
+
+                # case no connection file provided or connection file expired
+                if tm1_server_name not in tm1_services:
+                    resolved_params = resolve_tm1_params(config, tm1_server_name)
+                    # RushTI-managed defaults; any value explicitly set in
+                    # config.ini takes precedence (avoids "multiple values for
+                    # keyword argument" when e.g. connection_pool_size is set).
+                    service_kwargs = {
+                        "session_context": session_context,
+                        "connection_pool_size": max_workers,
+                    }
+                    service_kwargs.update(resolved_params)
+                    tm1_services[tm1_server_name] = TM1Service(**service_kwargs)
+
+                if connection_file:
+                    # implicitly re-connects if session is timed out
+                    tm1_services[tm1_server_name].server.get_product_version()
+                    tm1_services[tm1_server_name].save_to_file(
+                        file_name=Path(__file__).parent.parent.parent / connection_file
+                    )
+
+            # Instance not running, Firewall or wrong connection parameters
+            except Exception as e:
+                logger.error(
+                    "TM1 instance {} not accessible. Error: {}".format(tm1_server_name, str(e))
+                )
+
+    return tm1_services, tm1_preserve_connections
+
+
+def execute_chore_with_retries(tm1: TM1Service, task: Task, retries: int):
+    """Execute a TM1 chore with retry support.
+
+    Mirrors :func:`execute_process_with_retries` for the chore path.
+    Chore execution at the TM1 API boundary is binary: HTTP 204 = success
+    (no body to parse), any exception (typically HTTP 500 with a
+    "Chore execution failed" body) = failure.
+
+    Returns a 4-tuple shaped like the process variant for symmetry — the
+    ``status`` slot carries a short human-readable summary, ``error_log_file``
+    is always empty (chores write no per-execution error file), and
+    ``attempts`` is the 0-based attempt index of the result.
+
+    :raises Exception: re-raised on the final attempt when retries
+        exhausted, matching the process path's error propagation.
+    """
+    # Only retry when ``safe_retry`` is True. ``validate_tasks`` has
+    # already asserted the chore is SINGLE_COMMIT in that case so
+    # whole-chore retry cannot leak partial state.
+    effective_retries = retries if task.safe_retry else 0
+
+    for attempt in range(effective_retries + 1):
+        try:
+            tm1.chores.execute_chore(task.chore_name)
+            return True, "Completed", "", attempt
+        except Exception:
+            if attempt == effective_retries:
+                raise
+
+    # Defensive — loop body always returns or raises.
+    return False, "", "", effective_retries
+
+
+def execute_process_with_retries(tm1: TM1Service, task: Task, retries: int):
+    for attempt in range(retries + 1):
+        try:
+            # Execute process using TM1py's native timeout and cancel_at_timeout support
+            success, status, error_log_file = tm1.processes.execute_with_return(
+                process_name=task.process_name,
+                timeout=task.timeout,
+                cancel_at_timeout=task.cancel_at_timeout,
+                **task.parameters,
+            )
+
+            # Handle minor errors
+            if not success and task.succeed_on_minor_errors and status == "HasMinorErrors":
+                success = True
+                msg = MSG_PROCESS_HAS_MINOR_ERRORS.format(
+                    process=task.process_name,
+                    parameters=task.parameters,
+                    status=status,
+                    retries=retries,
+                    instance=task.instance_name,
+                    error_file=error_log_file,
+                )
+                logging.warning(msg)
+
+            if success:
+                return success, status, error_log_file, attempt
+
+        except TM1pyTimeout:
+            # Timeout should not be retried, raise immediately
+            raise
+
+        except Exception as e:
+            if attempt == retries:
+                # Raise exception on the final attempt
+                raise e
+
+    # If all retries fail
+    return False, status, error_log_file, retries
+
+
+def update_task_execution_results(func):
+    @functools.wraps(func)
+    def wrapper(ctx: ExecutionContext, task: Task, *args, **kwargs):
+        task_success = False
+        try:
+            task_success = func(ctx, task, *args, **kwargs)
+
+        finally:
+            # two optimized tasks can have the same id !
+            previous_task_success = ctx.task_execution_results.get(task.id, True)
+            ctx.task_execution_results[task.id] = previous_task_success and task_success
+
+        return task_success
+
+    return wrapper
+
+
+@update_task_execution_results
+def execute_task(
+    ctx: ExecutionContext, task: Task, retries: int, tm1_services: Dict[str, TM1Service]
+) -> bool:
+    """Execute one line from the txt file
+    :param task:
+    :param retries:
+    :param tm1_services:
+    :return:
+    """
+
+    # check predecessors success
+    if isinstance(task, OptimizedTask) and task.require_predecessor_success:
+        predecessors_ok = verify_predecessors_ok(ctx, task)
+        if not predecessors_ok:
+            return False
+
+    if task.instance_name not in tm1_services:
+        # Reuse the process-flavoured "instance not in config" message —
+        # the chore name slots in as the task identity for context.
+        msg = MSG_PROCESS_FAIL_INSTANCE_NOT_IN_CONFIG_FILE.format(
+            process_name=task.process_name or task.chore_name,
+            instance_name=task.instance_name,
+        )
+        logger.error(msg)
+        return False
+
+    # Dispatch to chore branch for chore-kind tasks. Mutual exclusion
+    # guarantees that ``chore_name`` is set iff ``process_name`` is not,
+    # so the dispatch is unambiguous.
+    if getattr(task, "chore_name", None):
+        return _execute_chore_task(ctx, task, retries, tm1_services)
+
+    tm1 = tm1_services[task.instance_name]
+    # Execute it - include stage in log if present
+    stage_info = f" [stage: {task.stage}]" if task.stage else ""
+    msg = (
+        MSG_PROCESS_EXECUTE.format(
+            process_name=task.process_name,
+            parameters=task.parameters,
+            instance_name=task.instance_name,
+        )
+        + stage_info
+    )
+    logger.info(msg)
+    start_time = datetime.now()
+
+    try:
+        success, status, error_log_file, attempts = execute_process_with_retries(
+            tm1=tm1, task=task, retries=retries
+        )
+        end_time = datetime.now()
+        elapsed_time = end_time - start_time
+
+        if success:
+            msg = MSG_PROCESS_SUCCESS
+            msg = msg.format(
+                process=task.process_name,
+                parameters=task.parameters,
+                instance=task.instance_name,
+                retries=attempts,
+                time=elapsed_time,
+            )
+            logger.info(msg)
+
+            # Log to structured execution logger
+            if ctx.execution_logger:
+                ctx.execution_logger.log_task_execution(
+                    task_id=task.id,
+                    instance=task.instance_name,
+                    process=task.process_name,
+                    parameters=task.parameters if isinstance(task.parameters, dict) else {},
+                    success=True,
+                    start_time=start_time,
+                    end_time=end_time,
+                    retry_count=attempts,
+                )
+
+            _collect_task_stats(
+                ctx,
+                task,
+                success=True,
+                start_time=start_time,
+                end_time=end_time,
+                retry_count=attempts,
+            )
+
+            return True
+
+        else:
+            msg = MSG_PROCESS_FAIL_WITH_ERROR_FILE.format(
+                process=task.process_name,
+                parameters=task.parameters,
+                status=status,
+                instance=task.instance_name,
+                retries=attempts,
+                time=elapsed_time,
+                error_file=error_log_file,
+            )
+            logger.error(msg)
+
+            # Log to structured execution logger
+            if ctx.execution_logger:
+                ctx.execution_logger.log_task_execution(
+                    task_id=task.id,
+                    instance=task.instance_name,
+                    process=task.process_name,
+                    parameters=task.parameters if isinstance(task.parameters, dict) else {},
+                    success=False,
+                    start_time=start_time,
+                    end_time=end_time,
+                    retry_count=attempts,
+                    error_message=f"Status: {status}, Error file: {error_log_file}",
+                )
+
+            _collect_task_stats(
+                ctx,
+                task,
+                success=False,
+                start_time=start_time,
+                end_time=end_time,
+                retry_count=attempts,
+                error_message=f"Status: {status}, Error file: {error_log_file}",
+            )
+
+            return False
+
+    except TM1pyTimeout as e:
+        # TM1py handles timeout and cancellation natively
+        end_time = datetime.now()
+        elapsed_time = end_time - start_time
+        msg = MSG_PROCESS_TIMEOUT.format(
+            process=task.process_name,
+            parameters=task.parameters,
+            timeout=task.timeout,
+            instance=task.instance_name,
+            time=elapsed_time,
+        )
+        logger.error(msg)
+        if ctx.execution_logger:
+            ctx.execution_logger.log_task_execution(
+                task_id=task.id,
+                instance=task.instance_name,
+                process=task.process_name,
+                parameters=task.parameters if isinstance(task.parameters, dict) else {},
+                success=False,
+                start_time=start_time,
+                end_time=end_time,
+                retry_count=0,
+                error_message=f"Task execution timed out: {str(e)}",
+            )
+        _collect_task_stats(
+            ctx,
+            task,
+            success=False,
+            start_time=start_time,
+            end_time=end_time,
+            retry_count=0,
+            error_message=f"Task execution timed out: {str(e)}",
+        )
+        return False
+
+    except Exception as e:
+        end_time = datetime.now()
+        elapsed_time = end_time - start_time
+        msg = MSG_PROCESS_FAIL_UNEXPECTED.format(
+            process=task.process_name,
+            parameters=task.parameters,
+            error=str(e),
+            time=elapsed_time,
+        )
+        logger.error(msg)
+
+        # Log to structured execution logger
+        if ctx.execution_logger:
+            ctx.execution_logger.log_task_execution(
+                task_id=task.id,
+                instance=task.instance_name,
+                process=task.process_name,
+                parameters=task.parameters if isinstance(task.parameters, dict) else {},
+                success=False,
+                start_time=start_time,
+                end_time=end_time,
+                retry_count=0,
+                error_message=str(e),
+            )
+
+        _collect_task_stats(
+            ctx,
+            task,
+            success=False,
+            start_time=start_time,
+            end_time=end_time,
+            retry_count=0,
+            error_message=str(e),
+        )
+
+        return False
+
+
+def _execute_chore_task(
+    ctx: ExecutionContext,
+    task: Task,
+    retries: int,
+    tm1_services: Dict[str, TM1Service],
+) -> bool:
+    """Execute a chore-kind task.
+
+    Parallel to the chore branch of :func:`execute_task` for processes.
+    Logs success/failure, records stats, and threads the chore identity
+    into the structured execution logger via the new ``chore=`` parameter.
+    """
+    tm1 = tm1_services[task.instance_name]
+    stage_info = f" [stage: {task.stage}]" if task.stage else ""
+    logger.info(
+        MSG_CHORE_EXECUTE.format(
+            chore_name=task.chore_name,
+            instance_name=task.instance_name,
+        )
+        + stage_info
+    )
+    start_time = datetime.now()
+
+    try:
+        success, status, _, attempts = execute_chore_with_retries(
+            tm1=tm1, task=task, retries=retries
+        )
+        end_time = datetime.now()
+        elapsed_time = end_time - start_time
+
+        if success:
+            logger.info(
+                MSG_CHORE_SUCCESS.format(
+                    chore=task.chore_name,
+                    instance=task.instance_name,
+                    retries=attempts,
+                    time=elapsed_time,
+                )
+            )
+
+            if ctx.execution_logger:
+                ctx.execution_logger.log_task_execution(
+                    task_id=task.id,
+                    instance=task.instance_name,
+                    process="",
+                    chore=task.chore_name,
+                    parameters={},
+                    success=True,
+                    start_time=start_time,
+                    end_time=end_time,
+                    retry_count=attempts,
+                )
+
+            _collect_task_stats(
+                ctx,
+                task,
+                success=True,
+                start_time=start_time,
+                end_time=end_time,
+                retry_count=attempts,
+            )
+            return True
+
+        # Unreachable in practice: chore execution returns True or raises.
+        # Guarded for symmetry with the process path.
+        return False
+
+    except Exception as e:
+        end_time = datetime.now()
+        elapsed_time = end_time - start_time
+        # ``attempts`` is the global ``retries`` ceiling when safe_retry
+        # is enabled and we exhausted the loop, else 0.
+        attempts = retries if task.safe_retry else 0
+        error = str(e)
+        logger.error(
+            MSG_CHORE_FAIL.format(
+                chore=task.chore_name,
+                instance=task.instance_name,
+                retries=attempts,
+                time=elapsed_time,
+                error=error,
+            )
+        )
+
+        if ctx.execution_logger:
+            ctx.execution_logger.log_task_execution(
+                task_id=task.id,
+                instance=task.instance_name,
+                process="",
+                chore=task.chore_name,
+                parameters={},
+                success=False,
+                start_time=start_time,
+                end_time=end_time,
+                retry_count=attempts,
+                error_message=error,
+            )
+
+        _collect_task_stats(
+            ctx,
+            task,
+            success=False,
+            start_time=start_time,
+            end_time=end_time,
+            retry_count=attempts,
+            error_message=error,
+        )
+        return False
+
+
+def verify_predecessors_ok(ctx: ExecutionContext, task: OptimizedTask) -> bool:
+    # Use the kind-appropriate identity for log messages — chore tasks
+    # have no process name and no parameters to render.
+    target = task.process_name or task.chore_name
+    parameters = task.parameters if task.process_name else {}
+
+    for predecessor_id in task.predecessors:
+        if predecessor_id not in ctx.task_execution_results:
+            msg = MSG_PROCESS_ABORTED_UNCOMPLETE_PREDECESSOR.format(
+                instance=task.instance_name,
+                process=target,
+                parameters=parameters,
+                predecessor=predecessor_id,
+            )
+            logger.error(msg)
+            return False
+
+        if not ctx.task_execution_results[predecessor_id]:
+            msg = MSG_PROCESS_ABORTED_FAILED_PREDECESSOR.format(
+                instance=task.instance_name,
+                process=target,
+                parameters=parameters,
+                predecessor=predecessor_id,
+            )
+            logger.error(msg)
+            return False
+
+    return True
+
+
+def validate_tasks(tasks: List[Task], tm1_services: Dict[str, TM1Service]) -> bool:
+    validated_processes: List[str] = []
+    # Chore validation is keyed by (instance, chore_name) — chore names
+    # are scoped to a server and existence must be checked per-instance.
+    # safe_retry tasks additionally trigger a SINGLE_COMMIT check.
+    validated_chores: set = set()
+    safe_retry_chore_checked: set = set()
+    validation_ok = True
+
+    tasks = [task for task in tasks if isinstance(task, Task)]  # --> ignore Wait(s)
+    for task in tasks:
+        tm1 = tm1_services[task.instance_name]
+
+        if getattr(task, "chore_name", None):
+            chore_key = (task.instance_name, task.chore_name)
+
+            # Existence check — dedup'd by (instance, chore_name).
+            if chore_key not in validated_chores:
+                validated_chores.add(chore_key)
+                if not tm1.chores.exists(task.chore_name):
+                    logger.error(
+                        MSG_CHORE_NOT_EXISTS.format(
+                            chore=task.chore_name, instance=task.instance_name
+                        )
+                    )
+                    validation_ok = False
+                    # Skip the safe_retry check — chore doesn't exist.
+                    continue
+
+            # SINGLE_COMMIT check — only fetched when safe_retry is True
+            # so we avoid the extra round-trip otherwise. Dedup'd
+            # independently so a mixed taskfile (some safe, some not)
+            # still triggers the fetch exactly once per chore.
+            if task.safe_retry and chore_key not in safe_retry_chore_checked:
+                safe_retry_chore_checked.add(chore_key)
+                chore = tm1.chores.get(task.chore_name)
+                if chore.execution_mode != Chore.SINGLE_COMMIT:
+                    logger.error(
+                        MSG_CHORE_REQUIRES_SINGLE_COMMIT.format(
+                            chore=task.chore_name,
+                            instance=task.instance_name,
+                            execution_mode=chore.execution_mode,
+                        )
+                    )
+                    validation_ok = False
+            continue
+
+        # Process branch (unchanged behaviour, slightly tidied).
+        current_task = {
+            "instance": task.instance_name,
+            "process": task.process_name,
+            "parameters": task.parameters.keys(),
+        }
+
+        # avoid repeated validations
+        if current_task["process"] in validated_processes:
+            continue
+
+        # check for process existence
+        if not tm1.processes.exists(task.process_name):
+            msg = MSG_PROCESS_NOT_EXISTS.format(
+                process=task.process_name, instance=task.instance_name
+            )
+            logger.error(msg)
+            validated_processes.append(current_task["process"])
+            validation_ok = False
+            continue
+
+        # check for parameters
+        task_params = task.parameters.keys()
+        if task_params:
+            process_params = [
+                param["Name"] for param in tm1.processes.get(task.process_name).parameters
+            ]
+
+            # check for missing parameter names
+            missing_params = [param for param in task_params if param not in process_params]
+            if len(missing_params) > 0:
+                msg = MSG_PROCESS_PARAMS_INCORRECT.format(
+                    process=task.process_name,
+                    parameters=missing_params,
+                    instance=task.instance_name,
+                )
+                logger.error(msg)
+                validation_ok = False
+
+        validated_processes.append(current_task["process"])
+
+    return validation_ok
+
+
+async def work_through_tasks_dag(
+    ctx: ExecutionContext,
+    dag: DAG,
+    max_workers: int,
+    retries: int,
+    tm1_services: dict,
+    checkpoint_manager: "CheckpointManager" = None,
+    task_optimizer: "TaskOptimizer" = None,
+    stage_workers: Optional[Dict[str, int]] = None,
+    tm1_preserve_connections: Optional[Dict] = None,
+    force_logout: bool = False,
+    on_first_task_start: Optional[Callable[[], None]] = None,
+) -> List[bool]:
+    """Execute tasks using DAG-based scheduling.
+
+    Tasks are executed as soon as their predecessors complete, maximizing
+    parallelism within the max_workers constraint.
+
+    When task_optimizer is provided, ready tasks are sorted using the
+    configured scheduling algorithm to improve parallel efficiency.
+
+    When stage_workers is provided, per-stage concurrency limits are enforced
+    in addition to the global max_workers ceiling. The global max_workers
+    always takes precedence as the absolute cap.
+
+    When tm1_preserve_connections is provided, early session release is enabled:
+    after each task completion, instances with no remaining tasks are logged out
+    immediately to free TM1 server resources and release exclusive locks.
+    Instances marked as preserved are exempt unless force_logout is True.
+
+    :param ctx: The current execution context
+    :param dag: DAG containing tasks and their dependencies
+    :param max_workers: Maximum number of concurrent workers
+    :param retries: Number of retries for failed tasks
+    :param tm1_services: Dictionary of TM1Service instances
+    :param checkpoint_manager: Optional CheckpointManager for resume support
+    :param task_optimizer: Optional TaskOptimizer for runtime-based scheduling
+    :param stage_workers: Optional per-stage worker limits (e.g. {"extract": 8, "load": 4})
+    :param tm1_preserve_connections: Optional dict indicating which connections to preserve.
+        When provided, enables early session release. Preserved connections are exempt
+        from early release unless force_logout is True.
+    :param force_logout: If True, force logout even from preserved connections (exclusive mode)
+    :param on_first_task_start: Optional callback, called once just before the first task
+        is submitted (ends the connection run phase)
+    :return: List of execution outcomes (True/False for each task)
+    """
+    loop = asyncio.get_event_loop()
+    task_start_times: Dict[str, datetime] = {}
+    # Track instances that have been early-released to avoid double-logout
+
+    with ThreadPoolExecutor(int(max_workers)) as executor:
+        # Map futures to tasks
+        pending_futures: Dict[asyncio.Future, Task] = {}
+
+        def submit_ready_tasks():
+            """Submit ready tasks up to max_workers limit.
+
+            If task_optimizer is provided, sorts ready tasks using the
+            configured scheduling algorithm before submission.
+
+            If stage_workers is provided, per-stage concurrency limits are
+            enforced. Tasks whose stage is at capacity are skipped (not
+            broken out of), allowing tasks from other stages to submit.
+            """
+            nonlocal on_first_task_start
+            if ctx.hung.is_set():
+                return  # the run is ending; tasks still running just finish
+            ready_tasks = dag.get_ready_tasks()
+
+            # Apply optimization if available (sort using configured algorithm)
+            if task_optimizer and ready_tasks:
+                ready_tasks = task_optimizer.sort_tasks(ready_tasks)
+
+            # Count running tasks per stage for per-stage limiting
+            running_per_stage: Dict[str, int] = {}
+            if stage_workers:
+                for pending_task in pending_futures.values():
+                    stage = getattr(pending_task, "stage", None)
+                    if stage:
+                        running_per_stage[stage] = running_per_stage.get(stage, 0) + 1
+
+            for task in ready_tasks:
+                if len(pending_futures) >= max_workers:
+                    break
+
+                # Enforce per-stage concurrency limit
+                if stage_workers:
+                    task_stage = getattr(task, "stage", None)
+                    if task_stage and task_stage in stage_workers:
+                        if running_per_stage.get(task_stage, 0) >= stage_workers[task_stage]:
+                            continue
+
+                if on_first_task_start:
+                    on_first_task_start()
+                    on_first_task_start = None  # only once
+
+                # Mark as running before submitting
+                dag.mark_running(task)
+                task_start_times[str(task.id)] = datetime.now()
+
+                # Update checkpoint
+                if checkpoint_manager:
+                    checkpoint_manager.mark_running(str(task.id))
+
+                future = loop.run_in_executor(
+                    executor, execute_task, ctx, task, retries, tm1_services
+                )
+                pending_futures[future] = task
+
+                # Update running_per_stage after submission
+                if stage_workers:
+                    task_stage = getattr(task, "stage", None)
+                    if task_stage:
+                        running_per_stage[task_stage] = running_per_stage.get(task_stage, 0) + 1
+
+        # Initial submission of ready tasks
+        submit_ready_tasks()
+
+        # Process until DAG is complete
+        while pending_futures:
+            # Wait for at least one task to complete
+            done, _ = await asyncio.wait(
+                pending_futures.keys(), return_when=asyncio.FIRST_COMPLETED
+            )
+
+            for future in done:
+                task = pending_futures.pop(future)
+                task_id = str(task.id)
+                try:
+                    success = future.result()
+                except Exception as e:
+                    logger.error(f"Unexpected error executing task {task_id}: {e}")
+                    success = False
+
+                ctx.task_outcomes.append(success)
+                dag.mark_complete(task, success)
+
+                # Calculate duration and update checkpoint
+                start_time = task_start_times.pop(task_id, datetime.now())
+                duration = (datetime.now() - start_time).total_seconds()
+
+                if checkpoint_manager:
+                    # Note: Retry count is tracked in stats database via _collect_task_stats.
+                    # Checkpoint only needs success/failure for resume; retry count is metadata.
+                    checkpoint_manager.mark_completed(
+                        task_id=task_id,
+                        success=success,
+                        duration_seconds=duration,
+                        retry_count=0,
+                        error_message=None if success else "Task failed",
+                    )
+
+            # Early session release: logout from instances with no remaining tasks.
+            # Only active when tm1_preserve_connections is provided (i.e. called from CLI).
+            # Direct callers (e.g. integration tests) that don't pass it won't trigger
+            # early release, preserving shared connection state across test methods.
+            #
+            # _logout_instance removes the entry from tm1_services on success, so the
+            # end-of-run logout() call cannot double-logout the same session (which
+            # would otherwise emit a CookieConflictError warning when the second
+            # logout response leaves a duplicate TM1SessionId in the cookie jar).
+            # Skipped once the run has hung: the hang handler logs out instead.
+            if tm1_preserve_connections is not None and not ctx.hung.is_set():
+                remaining = dag.get_remaining_tasks_by_instance()
+                for instance_name in list(tm1_services.keys()):
+                    if instance_name not in remaining:
+                        _logout_instance(
+                            instance_name,
+                            tm1_services,
+                            tm1_preserve_connections,
+                            force_logout,
+                        )
+
+            # Submit newly ready tasks
+            submit_ready_tasks()
+
+        # Handle any remaining tasks that couldn't be executed (shouldn't happen with valid DAG)
+        if not dag.is_complete():
+            logger.warning("DAG execution incomplete - some tasks may have unmet dependencies")
+
+    return list(ctx.task_outcomes)
+
+
+def _logout_instance(
+    instance_name: str,
+    tm1_services: Dict,
+    tm1_preserve_connections: Dict,
+    force: bool = False,
+):
+    """Logout from a single TM1 instance and remove it from ``tm1_services``.
+
+    Used for early session release when an instance has no remaining tasks.
+    On success the instance is removed from ``tm1_services`` so that the
+    end-of-run :func:`logout` call cannot double-logout the same session.
+    On failure or when skipped (preserved without force), the entry stays
+    so the final cleanup retries it.
+
+    :param instance_name: Name of the TM1 instance to logout from
+    :param tm1_services: Dictionary of TM1Service instances (mutated on success)
+    :param tm1_preserve_connections: Dictionary indicating which connections to preserve
+    :param force: If True, logout even from preserved connections
+    :return: True if logout was performed, False if skipped or failed
+    """
+    if instance_name not in tm1_services:
+        return False
+
+    if not force and tm1_preserve_connections.get(instance_name, False):
+        logger.debug(f"Preserving connection to {instance_name} (early release skipped)")
+        return False
+
+    try:
+        tm1_services[instance_name].logout()
+        del tm1_services[instance_name]
+        logger.info(f"Early session release: logged out from {instance_name} (no remaining tasks)")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed early logout from {instance_name}: {e}")
+        return False
+
+
+def logout(
+    tm1_services: Dict,
+    tm1_preserve_connections: Dict,
+    force: bool = False,
+):
+    """Logout from all remaining TM1 instances and remove them from ``tm1_services``.
+
+    Successfully logged-out instances are removed from ``tm1_services`` so
+    the dict consistently represents *live* connections. Pre-existing
+    entries that were already released via :func:`_logout_instance` are
+    therefore not double-logged-out — they're not in the dict anymore.
+
+    :param tm1_services: Dictionary of TM1Service instances (mutated)
+    :param tm1_preserve_connections: Dictionary indicating which connections to preserve
+    :param force: If True, logout from ALL connections including preserved ones.
+                  Use this for exclusive mode to ensure sessions are properly closed.
+    :return: None
+    """
+    # Snapshot keys so del-on-success doesn't perturb iteration.
+    for connection in list(tm1_services.keys()):
+        # Skip preserved connections unless force is True
+        if not force and tm1_preserve_connections.get(connection, False) is True:
+            logger.debug(f"Preserving connection to {connection}")
+            continue
+
+        try:
+            tm1_services[connection].logout()
+            del tm1_services[connection]
+            logger.debug(f"Logged out from {connection}")
+        except Exception as e:
+            logger.warning(f"Failed to logout from {connection}: {e}")
+
+
+def _logout_quietly(name: str, service: TM1Service) -> None:
+    try:
+        service.logout()
+        logger.debug(f"Logged out from {name}")
+    except Exception as e:
+        logger.warning(f"Failed to logout from {name}: {e}")
+
+
+def logout_in_background(sessions: List[Tuple[str, TM1Service]], timeout: float) -> List[str]:
+    """Log out of each session on its own daemon thread, waiting at most ``timeout`` in total.
+
+    Used when a run hangs: a logout may itself block on the TM1 server, and
+    must not hold up the exit. A logout that hasn't finished is given up on.
+
+    :param sessions: ``(name, service)`` pairs to log out of
+    :param timeout: Seconds to wait for all logouts together
+    :return: Names of the sessions whose logout didn't finish in time
+    """
+    threads = []
+    for name, service in sessions:
+        thread = threading.Thread(
+            target=_logout_quietly, args=(name, service), name=f"logout-{name}", daemon=True
+        )
+        thread.start()
+        threads.append((name, thread))
+
+    deadline = time.monotonic() + timeout
+    for _, thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    return [name for name, thread in threads if thread.is_alive()]

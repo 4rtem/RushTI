@@ -1,0 +1,560 @@
+"""Settings module for RushTI configuration.
+
+This module provides configuration management through settings.ini file,
+separate from TM1 connection settings in config.ini.
+
+Settings precedence (highest to lowest):
+1. CLI arguments
+2. JSON task file settings section
+3. settings.ini file
+4. Built-in defaults
+"""
+
+import configparser
+import logging
+import os
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from rushti.utils import get_application_directory, resolve_app_path
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DefaultsSettings:
+    """Default execution settings."""
+
+    max_workers: int = 4
+    retries: int = 0
+    result_file: str = ""
+    mode: str = "norm"
+
+
+@dataclass
+class OptimizationSettings:
+    """EWMA tuning parameters for task runtime estimation.
+
+    These settings control how the optimizer calculates runtime estimates
+    from historical execution data. They are system-wide and rarely changed.
+
+    Optimization itself is activated per-taskfile via:
+    - CLI: --optimize <algorithm>
+    - JSON taskfile: "optimization_algorithm": "<algorithm>"
+    """
+
+    lookback_runs: int = 10
+    time_of_day_weighting: bool = False
+    min_samples: int = 3
+    cache_duration_hours: int = 24
+
+
+@dataclass
+class TM1IntegrationSettings:
+    """TM1 integration settings for reading taskfiles and pushing results.
+
+    Dimensions and cube created by build mode:
+    - rushti_workflow: Workflow identifiers
+    - rushti_task_id: Task sequence elements (1-5000)
+    - rushti_run_id: Run timestamps (YYYYMMDD_HHMMSS) + Input element
+    - rushti_measure: Log field measures
+    - rushti: Cube for task definitions and log storage
+
+    When push_results is enabled, the results CSV is uploaded to TM1 files.
+    When auto_load_results is also enabled, }rushti.load.results TI process
+    is called after upload to load the CSV into the rushti cube.
+    """
+
+    push_results: bool = False
+    auto_load_results: bool = False
+    detailed_results: bool = False
+    tm1_instance: Optional[str] = None
+    default_tm1_instance: Optional[str] = None
+    default_rushti_cube: str = "rushti"
+    default_workflow_dim: str = "rushti_workflow"
+    default_task_id_dim: str = "rushti_task_id"
+    default_run_id_dim: str = "rushti_run_id"
+    default_measure_dim: str = "rushti_measure"
+
+
+@dataclass
+class ExclusiveModeSettings:
+    """Exclusive mode execution settings.
+
+    Uses TM1 session context fields for detection:
+    - Normal mode: RushTI{workflow}
+    - Exclusive mode: RushTIX{workflow}
+    """
+
+    enabled: bool = False
+    polling_interval: int = 30
+    timeout: int = 600
+
+
+@dataclass
+class ResumeSettings:
+    """Resume/checkpoint feature settings."""
+
+    enabled: bool = False
+    checkpoint_interval: int = 60
+    checkpoint_dir: str = "./checkpoints"
+    auto_resume: bool = False
+
+
+@dataclass
+class TimeoutsSettings:
+    """Time limits for each run phase, in seconds (0 = no limit).
+
+    A run phase going past its limit is a hang: RushTI writes a ``TimedOut``
+    result and terminates. See ``rushti.timeouts``.
+    """
+
+    task_retrieval: int = 0
+    connection: int = 0
+    task_execution: int = 0
+    push_results: int = 0
+
+
+#: Run phases in execution order (see CONTEXT.md, "Run phase")
+RUN_PHASES = tuple(f.name for f in fields(TimeoutsSettings))
+
+
+@dataclass
+class StatsSettings:
+    """Stats storage settings.
+
+    Supported backends:
+    - sqlite (default): local SQLite file
+    - dynamodb: AWS DynamoDB tables
+
+    Stats storage stores execution statistics for:
+    - Optimization features (EWMA runtime estimation)
+    - TM1 cube logging data source
+    - Historical analysis
+    """
+
+    enabled: bool = False
+    retention_days: int = 90
+    backend: str = "sqlite"
+    db_path: str = ""
+    dynamodb_region: str = ""
+    dynamodb_runs_table: str = "rushti_runs"
+    dynamodb_task_results_table: str = "rushti_task_results"
+    dynamodb_endpoint_url: str = ""
+
+
+@dataclass
+class Settings:
+    """Main settings container with all configuration sections."""
+
+    defaults: DefaultsSettings = field(default_factory=DefaultsSettings)
+    optimization: OptimizationSettings = field(default_factory=OptimizationSettings)
+    tm1_integration: TM1IntegrationSettings = field(default_factory=TM1IntegrationSettings)
+    exclusive_mode: ExclusiveModeSettings = field(default_factory=ExclusiveModeSettings)
+    resume: ResumeSettings = field(default_factory=ResumeSettings)
+    stats: StatsSettings = field(default_factory=StatsSettings)
+    timeouts: TimeoutsSettings = field(default_factory=TimeoutsSettings)
+
+
+# Known sections and their valid keys with types
+SETTINGS_SCHEMA = {
+    "defaults": {
+        "max_workers": int,
+        "retries": int,
+        "result_file": str,
+        "mode": str,
+    },
+    "optimization": {
+        "lookback_runs": int,
+        "time_of_day_weighting": bool,
+        "min_samples": int,
+        "cache_duration_hours": int,
+    },
+    "tm1_integration": {
+        "push_results": bool,
+        "auto_load_results": bool,
+        "detailed_results": bool,
+        "tm1_instance": str,
+        "default_tm1_instance": str,
+        "default_rushti_cube": str,
+        "default_workflow_dim": str,
+        "default_task_id_dim": str,
+        "default_run_id_dim": str,
+        "default_measure_dim": str,
+    },
+    "exclusive_mode": {
+        "enabled": bool,
+        "polling_interval": int,
+        "timeout": int,
+    },
+    "resume": {
+        "enabled": bool,
+        "checkpoint_interval": int,
+        "checkpoint_dir": str,
+        "auto_resume": bool,
+    },
+    "stats": {
+        "enabled": bool,
+        "retention_days": int,
+        "backend": str,
+        "db_path": str,
+        "dynamodb_region": str,
+        "dynamodb_runs_table": str,
+        "dynamodb_task_results_table": str,
+        "dynamodb_endpoint_url": str,
+    },
+    "timeouts": {
+        "task_retrieval": int,
+        "connection": int,
+        "task_execution": int,
+        "push_results": int,
+    },
+}
+
+# Valid values for string settings
+VALID_VALUES = {
+    "mode": ["norm", "opt"],
+    "level": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+    "backend": ["sqlite", "dynamodb"],
+}
+
+
+def parse_bool(value: str) -> bool:
+    """Parse a string value as boolean.
+
+    :param value: String value to parse
+    :return: Boolean value
+    :raises ValueError: If value is not a valid boolean string
+    """
+    if value.lower() in ("true", "yes", "1", "on"):
+        return True
+    elif value.lower() in ("false", "no", "0", "off"):
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: '{value}'")
+
+
+def parse_value(value: str, expected_type: type) -> Any:
+    """Parse a string value to the expected type.
+
+    :param value: String value to parse
+    :param expected_type: Expected Python type
+    :return: Parsed value
+    :raises ValueError: If value cannot be parsed to expected type
+    """
+    if expected_type is bool:
+        return parse_bool(value)
+    elif expected_type is int:
+        try:
+            return int(value)
+        except ValueError:
+            raise ValueError(f"Invalid integer value: '{value}'")
+    elif expected_type is str:
+        return value
+    else:
+        return value
+
+
+def validate_setting(section: str, key: str, value: Any) -> None:
+    """Validate a setting value.
+
+    :param section: Section name
+    :param key: Setting key
+    :param value: Setting value
+    :raises ValueError: If value is invalid
+    """
+    # Check for valid values constraint
+    if key in VALID_VALUES:
+        valid = VALID_VALUES[key]
+        if isinstance(value, str) and value.lower() not in [v.lower() for v in valid]:
+            raise ValueError(
+                f"Invalid value '{value}' for {section}.{key}. " f"Valid values: {', '.join(valid)}"
+            )
+
+    # Check integer ranges
+    if isinstance(value, int):
+        if key in (
+            "max_workers",
+            "retries",
+            "port",
+            "lookback_runs",
+            "min_samples",
+            "polling_interval",
+            "timeout",
+            "checkpoint_interval",
+            "max_file_size_mb",
+            "backup_count",
+            "cache_duration_hours",
+        ):
+            if value < 0:
+                raise ValueError(f"{section}.{key} must be non-negative, got {value}")
+        if section == "timeouts" and value < 0:
+            raise ValueError(f"{section}.{key} must be non-negative, got {value}")
+        if key == "max_workers" and value < 1:
+            raise ValueError(f"{section}.{key} must be at least 1, got {value}")
+
+
+def resolve_settings_path(script_dir: Path) -> tuple[Path, bool]:
+    """Resolve settings.ini path with fallback to legacy location.
+
+    :param script_dir: Directory containing the script
+    :return: Tuple of (resolved path, is_legacy_path)
+    """
+    new_path = script_dir / "config" / "settings.ini"
+    legacy_path = script_dir / "settings.ini"
+
+    # Check new location first
+    if new_path.exists():
+        return new_path, False
+
+    # Fallback to legacy location
+    if legacy_path.exists():
+        return legacy_path, True
+
+    # Neither exists - return new path
+    return new_path, False
+
+
+def load_settings(settings_path: Optional[str] = None) -> Settings:
+    """Load settings from settings.ini file.
+
+    :param settings_path: Path to settings.ini file. If None, looks for
+                         settings.ini in config/ directory first, then
+                         falls back to current working directory for backward compatibility.
+    :return: Settings object with loaded configuration
+    """
+    settings = Settings()
+
+    # Determine settings file path
+    if settings_path is None:
+        # 1. Check RUSHTI_DIR environment variable (config files in config/ subdir)
+        rushti_dir = os.environ.get("RUSHTI_DIR")
+        if rushti_dir:
+            env_path = Path(rushti_dir) / "config" / "settings.ini"
+            if env_path.exists():
+                settings_path = env_path
+            else:
+                logger.warning(
+                    f"RUSHTI_DIR is set to '{rushti_dir}' but "
+                    f"'settings.ini' was not found in '{rushti_dir}/config/'"
+                )
+
+        # 2. Fall back to application directory-based discovery
+        # Use get_application_directory() (exe dir for frozen, project root for dev)
+        # instead of CWD, which may differ when launched from TM1 or other processes
+        if settings_path is None:
+            app_dir = Path(get_application_directory())
+            settings_path, is_legacy = resolve_settings_path(app_dir)
+            if is_legacy:
+                logger.warning(
+                    "DEPRECATION: 'settings.ini' found in root directory. "
+                    "Please move it to 'config/settings.ini'. "
+                    "Legacy path support will be removed in a future version."
+                )
+    else:
+        settings_path = Path(settings_path)
+
+    # If settings file doesn't exist, return defaults
+    if not settings_path.exists():
+        logger.debug(f"Settings file not found at {settings_path}, using defaults")
+        return settings
+
+    logger.info(f"Loading settings from {settings_path}")
+
+    config = configparser.ConfigParser()
+    try:
+        config.read(settings_path)
+    except configparser.Error as e:
+        logger.error(f"Error parsing settings.ini: {e}")
+        raise ValueError(f"Invalid settings.ini format: {e}")
+
+    # Process each section
+    for section in config.sections():
+        if section not in SETTINGS_SCHEMA:
+            logger.warning(f"Unknown section '{section}' in settings.ini (possible typo?)")
+            continue
+
+        section_schema = SETTINGS_SCHEMA[section]
+        section_obj = getattr(settings, section.replace("-", "_"))
+
+        for key, value in config.items(section):
+            if key not in section_schema:
+                logger.warning(f"Unknown setting '{key}' in [{section}] (possible typo?)")
+                continue
+
+            expected_type = section_schema[key]
+            # An empty time limit means no limit
+            if section == "timeouts" and not value.strip():
+                value = "0"
+            try:
+                parsed_value = parse_value(value, expected_type)
+                validate_setting(section, key, parsed_value)
+                setattr(section_obj, key, parsed_value)
+            except ValueError as e:
+                raise ValueError(f"Error in settings.ini [{section}].{key}: {e}")
+
+    # Resolve paths relative to application directory
+    settings.resume.checkpoint_dir = resolve_app_path(settings.resume.checkpoint_dir)
+
+    if not settings.tm1_integration.tm1_instance and settings.tm1_integration.default_tm1_instance:
+        logger.warning(
+            "DEPRECATION: [tm1_integration].default_tm1_instance is deprecated. "
+            "Rename to tm1_instance. The deprecated key will continue to work "
+            "but may be removed in a future major version."
+        )
+
+    return settings
+
+
+def resolve_tm1_instance(
+    tm1_instance: Optional[str],
+    settings: Settings,
+    json_settings: Optional[Dict[str, Any]] = None,
+) -> tuple[Optional[str], str]:
+    """Resolve the effective TM1 instance for results-push, with source tier.
+
+    Walks the 4-tier precedence chain (highest to lowest), returning the
+    first non-empty value alongside a label identifying the tier:
+
+    1. CLI argument (``tm1_instance``) → label ``"cli"``
+    2. Taskfile JSON ``settings.tm1_instance`` → label ``"taskfile"``
+    3. ``settings.ini [tm1_integration].tm1_instance`` → label
+       ``"settings.tm1_instance"``
+    4. ``settings.ini [tm1_integration].default_tm1_instance`` (deprecated)
+       → label ``"settings.default_tm1_instance"``
+
+    Empty strings at any tier are treated as unset (fall through).
+
+    ``json_settings`` is the taskfile JSON ``settings`` dict (as returned by
+    ``TaskfileSettings.to_dict``). It is consulted separately so the
+    resolver can distinguish tier 2 from tier 3 — by the time
+    ``get_effective_settings`` has been applied, the JSON-sourced
+    ``tm1_instance`` has already overwritten the settings.ini value in the
+    merged ``Settings`` object, and the provenance is otherwise lost.
+
+    :param tm1_instance: Value from the CLI (e.g. ``run --tm1-instance``).
+    :param settings: Settings object (post-merge).
+    :param json_settings: Taskfile JSON settings dict; tier 2 lookup.
+    :return: ``(value, source_label)``; ``(None, "none")`` when all tiers
+        are empty.
+    """
+    if tm1_instance:
+        return tm1_instance, "cli"
+
+    if json_settings:
+        taskfile_value = json_settings.get("tm1_instance")
+        if taskfile_value:
+            return taskfile_value, "taskfile"
+
+    settings_value = settings.tm1_integration.tm1_instance
+    if settings_value:
+        return settings_value, "settings.tm1_instance"
+
+    deprecated_value = settings.tm1_integration.default_tm1_instance
+    if deprecated_value:
+        return deprecated_value, "settings.default_tm1_instance"
+
+    return None, "none"
+
+
+def get_effective_settings(
+    settings: Settings,
+    cli_args: Optional[Dict[str, Any]] = None,
+    json_settings: Optional[Dict[str, Any]] = None,
+) -> Settings:
+    """Merge settings from all sources with proper precedence.
+
+    Precedence (highest to lowest):
+    1. CLI arguments
+    2. JSON task file settings section
+    3. settings.ini values (already in settings object)
+    4. Built-in defaults (already in settings object)
+
+    :param settings: Base settings loaded from settings.ini
+    :param cli_args: CLI arguments that override settings
+    :param json_settings: JSON task file settings section
+    :return: Settings with all overrides applied
+    """
+    # Apply JSON settings first (lower precedence than CLI)
+    if json_settings:
+        _apply_json_settings(settings, json_settings)
+
+    # Apply CLI arguments last (highest precedence)
+    if cli_args:
+        _apply_cli_args(settings, cli_args)
+
+    # Log effective settings at debug level
+    logger.debug("Effective settings:")
+    logger.debug(f"  defaults.max_workers: {settings.defaults.max_workers}")
+    logger.debug(f"  defaults.retries: {settings.defaults.retries}")
+    logger.debug(f"  defaults.result_file: {settings.defaults.result_file}")
+    logger.debug(f"  defaults.mode: {settings.defaults.mode}")
+
+    return settings
+
+
+def _apply_json_settings(settings: Settings, json_settings: Dict[str, Any]) -> None:
+    """Apply settings from JSON task file.
+
+    :param settings: Settings object to update
+    :param json_settings: Settings dict from JSON task file
+    """
+    # Map JSON keys to settings attributes
+    json_to_settings = {
+        "max_workers": ("defaults", "max_workers"),
+        "retries": ("defaults", "retries"),
+        "result_file": ("defaults", "result_file"),
+        "exclusive": ("exclusive_mode", "enabled"),
+        "push_results": ("tm1_integration", "push_results"),
+        "auto_load_results": ("tm1_integration", "auto_load_results"),
+        "detailed_results": ("tm1_integration", "detailed_results"),
+        "tm1_instance": ("tm1_integration", "tm1_instance"),
+    }
+
+    for json_key, (section, attr) in json_to_settings.items():
+        if json_key not in json_settings:
+            continue
+        value = json_settings[json_key]
+        if value is None:
+            continue
+        if isinstance(value, str) and value == "":
+            continue
+        section_obj = getattr(settings, section)
+        setattr(section_obj, attr, value)
+        logger.debug(f"JSON override: {section}.{attr} = {value}")
+
+    # Nested object: each phase listed overrides settings.ini, the rest keep it
+    for phase, value in (json_settings.get("timeouts") or {}).items():
+        setattr(settings.timeouts, phase, value)
+        logger.debug(f"JSON override: timeouts.{phase} = {value}")
+
+
+def _apply_cli_args(settings: Settings, cli_args: Dict[str, Any]) -> None:
+    """Apply CLI argument overrides.
+
+    :param settings: Settings object to update
+    :param cli_args: CLI arguments dict
+    """
+    # Map CLI args to settings attributes
+    cli_to_settings = {
+        "max_workers": ("defaults", "max_workers"),
+        "retries": ("defaults", "retries"),
+        "output_file": ("defaults", "result_file"),
+        "execution_mode": ("defaults", "mode"),
+        "detailed_results": ("tm1_integration", "detailed_results"),
+        "timeout_task_retrieval": ("timeouts", "task_retrieval"),
+        "timeout_connection": ("timeouts", "connection"),
+        "timeout_task_execution": ("timeouts", "task_execution"),
+        "timeout_push_results": ("timeouts", "push_results"),
+    }
+
+    for cli_key, (section, attr) in cli_to_settings.items():
+        if cli_key in cli_args and cli_args[cli_key] is not None and cli_args[cli_key] != "":
+            section_obj = getattr(settings, section)
+            value = cli_args[cli_key]
+            # Convert ExecutionMode enum to string if needed
+            if hasattr(value, "name"):
+                value = value.name.lower()
+            setattr(section_obj, attr, value)
+            logger.debug(f"CLI override: {section}.{attr} = {value}")

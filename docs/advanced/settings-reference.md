@@ -1,0 +1,518 @@
+# Settings Reference
+
+Complete reference for `config/settings.ini`. RushTI reads this file at startup and applies its values as defaults. CLI flags and JSON task file settings take precedence over values defined here.
+
+---
+
+## Settings Precedence
+
+RushTI resolves each setting from multiple sources using a strict priority order:
+
+```
+CLI arguments > JSON task file settings > settings.ini > Built-in defaults
+```
+
+When the same setting appears in multiple sources, the highest-priority source wins. For example, `--max-workers 16` on the command line overrides `"max_workers": 12` in the task file, which overrides `max_workers = 8` in `settings.ini`, which overrides the built-in default of `4`.
+
+!!! tip "Debugging Settings Resolution"
+    Run with `--log-level DEBUG` to see exactly which source each setting was resolved from:
+    ```bash
+    rushti run --tasks tasks.json --log-level DEBUG
+    ```
+
+---
+
+## File Location
+
+RushTI searches for `settings.ini` in the following order:
+
+1. Path specified via `--settings` / `-s` CLI argument
+2. `RUSHTI_DIR` environment variable (looks for `config/settings.ini` under this directory)
+3. `./settings.ini` (current directory -- legacy location, deprecation warning emitted)
+4. `./config/settings.ini` (recommended location)
+
+If no file is found, built-in defaults are used for all settings.
+
+### config.ini location
+
+`config.ini` (TM1 connection parameters) is resolved separately, with its own
+precedence (highest wins):
+
+1. `--config` CLI flag (TM1-connecting commands: `run`, `build`, `tasks …`, `resume`)
+2. `RUSHTI_DIR` environment variable (looks for `config/config.ini` under this directory)
+3. `./config.ini` (current directory -- legacy location, deprecation warning emitted)
+4. `./config/config.ini` (recommended location)
+
+`--config` relocates **only** `config.ini`; `settings.ini` keeps `--settings`
+and `logging_config.ini` keeps its own resolution. Use it to share a single
+read-only `config.ini` with other tm1py utilities. A missing `--config` path
+fails fast (exit 1, no traceback). When `--config` is absent, resolution is
+unchanged.
+
+---
+
+## Configuration Sections
+
+### [defaults]
+
+Common execution settings that control basic RushTI behavior.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `max_workers` | int | `4` | Maximum number of parallel workers. Valid range: 1--100. Recommended: start at 4, increase based on TM1 server capacity. |
+| `retries` | int | `0` | Number of retry attempts for failed TI process executions. Valid range: 0--10. Retries use exponential backoff (1s, 2s, 4s, ...). |
+| `result_file` | str | `""` (empty) | CSV output path for execution summary. Empty string means no CSV is created. Written on every run outcome; an aborted run reports `Overall Success` = `False`. The last column, `Status`, says how the run ended: `Success`, `Failed` (at least one task failed), `Aborted` (stopped on an error, including the exclusive-mode wait running out) or `TimedOut` (a [run phase time limit](../features/timeouts.md) was hit). |
+| `mode` | str | `norm` | Default execution mode (`norm` or `opt`) for **cube reads** (`--tm1-instance`). A cube read cannot auto-detect its mode, so this value (or the `--mode` CLI override) decides whether the `predecessors` measure is honoured (`opt`) or the `wait` measure drives sequencing (`norm`). **Ignored for file sources**, where the mode is auto-detected from file content. See [Choosing the mode for cube reads](../features/tm1-integration.md#choosing-the-mode-for-cube-reads). |
+
+**Overridable via CLI:** `--max-workers` / `-w`, `--retries` / `-r`, `--result` / `-o`, `--mode` / `-m`
+
+**Overridable via JSON task file:** `max_workers`, `retries`, `result_file`
+
+---
+
+### [optimization]
+
+EWMA tuning parameters for task runtime estimation. These settings control how the optimizer calculates runtime estimates from historical execution data. They are system-wide and rarely changed.
+
+Optimization itself is **off by default** and activated per-taskfile via:
+
+- **CLI:** `--optimize longest_first` or `--optimize shortest_first`
+- **JSON task file:** `"optimization_algorithm": "shortest_first"` in the settings section
+
+CLI `--optimize` overrides the JSON taskfile setting. Omitting both means no optimization.
+
+**Prerequisite:** Requires `[stats] enabled = true` to collect the historical execution data that optimization needs.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `lookback_runs` | int | `10` | Number of recent successful runs to consider when computing EWMA estimates. Valid range: 1--100. |
+| `time_of_day_weighting` | bool | `false` | Weight historical runs at similar times of day more heavily. Useful for processes whose performance varies by time of day (e.g., overnight batch vs. daytime). When enabled, the estimate cache is disabled and recalculated each run. |
+| `min_samples` | int | `3` | Minimum number of successful historical samples required before optimization activates for a task. Tasks with fewer samples use a default 10-second estimate. |
+| `cache_duration_hours` | int | `24` | Hours to cache EWMA estimates between runs. Ignored when `time_of_day_weighting` is enabled. |
+
+**Overridable via CLI:** `--optimize <algorithm>` (activates optimization with the chosen scheduling algorithm)
+
+**Overridable via JSON task file:** `optimization_algorithm` (string: `"longest_first"` or `"shortest_first"`)
+
+!!! note "How EWMA Works"
+    EWMA (Exponentially Weighted Moving Average) gives more weight to recent execution times while smoothing out outliers. The `lookback_runs` value determines how many historical data points are considered. A higher value produces more stable estimates; a lower value adapts faster to changes.
+
+---
+
+### Logging
+
+Logging is configured exclusively through `config/logging_config.ini`, which uses Python's standard `logging.config.fileConfig` format. This file controls log level, handlers, formatters, and file rotation.
+
+By default, RushTI writes `rushti.log` to the application root directory (next to the executable or under `RUSHTI_DIR`). The log level can be overridden at runtime with `--log-level` / `-L`.
+
+See `config/logging_config.ini` for the full configuration.
+
+#### Log File Path Resolution
+
+Relative file paths in `logging_config.ini` (e.g., `'rushti.log'`) are automatically resolved against the **application directory** — not the current working directory. This means the log file is always created in the expected location, even when RushTI is invoked from a different directory (e.g., via TM1's `ExecuteCommand` where the working directory is typically `C:\windows\system32`).
+
+The application directory is determined by:
+
+1. `RUSHTI_DIR` environment variable (if set)
+2. The directory containing the executable (for standalone `.exe` builds)
+3. The project root (for pip-installed scripts)
+
+If you specify an **absolute path** in `logging_config.ini` (e.g., `'E:/logs/rushti.log'`), it is used as-is.
+
+!!! tip "Choosing a Log Level"
+    - **DEBUG**: Full worker activity, task scheduling decisions, connection details. Use for troubleshooting.
+    - **INFO**: Normal operations -- task starts/completions, run summary. Default for production.
+    - **WARNING**: Only issues that may need attention (deprecated features, non-blocking failures).
+    - **ERROR**: Only failures that affect task execution.
+
+---
+
+### [tm1_integration]
+
+Controls TM1-based read/write integration: reading task files from a TM1 cube and pushing execution results back to TM1.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `push_results` | bool | `false` | Upload the results CSV to the TM1 Applications folder after each run. The file is named `rushti_{workflow}_{run_id}.csv` (with `.blb` extension for TM1 < v12). |
+| `auto_load_results` | bool | `false` | After uploading results (requires `push_results = true`), call the `}rushti.load.results` TI process on the target TM1 instance to load the CSV into the rushti cube. Passes `pSourceFile` and `pTargetCube` parameters. The process must exist on the target instance. |
+| `detailed_results` | bool | `false` | Emit one cube row per executed TI when pushing results, instead of summarizing expanded tasks (only meaningful with `push_results = true`). Each row gets a fresh sequential `task_id`; the original IDs are preserved in the new `original_task_id` measure. See [TM1 integration: detailed results](../features/tm1-integration.md#detailed-results). |
+| `tm1_instance` | str | *(none)* | TM1 instance (from `config.ini`) used as the **results-push target** when no higher-precedence override is set. Resolved per [the 4-tier chain](../features/tm1-integration.md#per-workflow-target-instance): CLI `--tm1-instance` > taskfile `settings.tm1_instance` > this key > `default_tm1_instance` (deprecated). Required when `push_results` is enabled and no higher tier is set. |
+| `default_tm1_instance` | str | *(none)* | **Deprecated** — use `tm1_instance`. Honoured indefinitely as the final fallback in the resolution chain; a one-shot `DEPRECATION:` warning fires at settings load *only* when it's actually being used (i.e. `tm1_instance` is unset). |
+| `default_rushti_cube` | str | `rushti` | Name of the TM1 cube for task definitions and execution results. Created by the `rushti build` command. |
+| `default_workflow_dim` | str | `rushti_workflow` | Dimension name for workflow identifiers. |
+| `default_task_id_dim` | str | `rushti_task_id` | Dimension name for task sequence elements (1--5000 default elements). |
+| `default_run_id_dim` | str | `rushti_run_id` | Dimension name for run timestamps (`YYYYMMDD_HHMMSS`) plus an `Input` element for definitions. |
+| `default_measure_dim` | str | `rushti_measure` | Dimension name for log field measures. |
+
+**Overridable via CLI:** `--tm1-instance`, `--workflow` / `-W`
+
+**Overridable via CLI:** `--detailed-results`
+
+**Overridable via JSON task file:** `push_results`, `auto_load_results`, `detailed_results`, `tm1_instance`
+
+!!! info "Setting Up TM1 Integration"
+    Run `rushti build --tm1-instance <instance>` to create the required dimensions and cube automatically before enabling `push_results`.
+
+---
+
+### [exclusive_mode]
+
+Prevents concurrent RushTI executions by checking TM1 server sessions for other RushTI instances.
+
+RushTI identifies sessions using the TM1 session context field:
+
+- **Normal mode:** `RushTI_{workflow}`
+- **Exclusive mode:** `RushTIX_{workflow}`
+
+**Interaction matrix:**
+
+| Current Run | Other Session | Result |
+|-------------|---------------|--------|
+| Exclusive | Any RushTI session running | Wait |
+| Non-exclusive | Exclusive session running | Wait |
+| Non-exclusive | Non-exclusive session running | Proceed |
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable exclusive mode by default for all runs. Can also be enabled per-taskfile via JSON settings or `--exclusive` flag. |
+| `polling_interval` | int | `30` | Seconds between TM1 session checks while waiting for exclusive access. Valid range: 5--300. |
+| `timeout` | int | `600` | Maximum seconds to wait for exclusive access before the run fails with `ExclusiveModeTimeoutError`. Valid range: 0--3600. |
+
+**Overridable via CLI:** `--exclusive` / `-x`, `--force` / `-f` (bypasses checks)
+
+**Overridable via JSON task file:** `exclusive` (boolean in settings section)
+
+---
+
+### [timeouts]
+
+Optional time limits for each run phase, in seconds. A run phase that goes past its limit is a hang: RushTI writes the result file with `Status` = `TimedOut`, keeps the checkpoint, logs out of TM1 and exits with code 1. See [Run Phase Time Limits](../features/timeouts.md).
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `task_retrieval` | int | `0` (no limit) | Connecting to the source instance and reading the taskfile from the `rushti` cube. Only used for TM1 sources (`--tm1-instance`). |
+| `connection` | int | `0` (no limit) | Connecting to the TM1 instances the tasks run on, until the first task starts. Includes parameter expansion and checking that the processes exist. The exclusive-mode wait doesn't count. |
+| `task_execution` | int | `0` (no limit) | From the first task starting to the last task finishing, including the logout from the task instances. |
+| `push_results` | int | `0` (no limit) | Connecting to the results target, uploading the results and running `}rushti.load.results`. Only used when `push_results = true`. |
+
+`0` or an empty value means no limit. Negative or non-integer values are an error.
+
+**Overridable via CLI:** `--timeout-task-retrieval`, `--timeout-connection`, `--timeout-task-execution`, `--timeout-push-results`
+
+**Overridable via JSON task file:** `timeouts` (object in the settings section, e.g. `{"connection": 60}`)
+
+---
+
+### [resume]
+
+Controls checkpoint saving and resume capability. When enabled, RushTI periodically saves execution state so that interrupted runs can be resumed from the point of failure.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable automatic checkpoint saving during execution. |
+| `checkpoint_interval` | int | `60` | Seconds between checkpoint saves. Valid range: 10--600. Lower values provide finer recovery granularity but add I/O overhead. |
+| `checkpoint_dir` | str | `./checkpoints` | Directory where checkpoint JSON files are stored. Created automatically if it does not exist. |
+| `auto_resume` | bool | `false` | Automatically resume from the last checkpoint on restart. When `false`, use the `rushti resume` command to manually resume. |
+
+**Overridable via CLI:** `--no-checkpoint` (disables for the current run)
+
+!!! tip "Checkpoint Files"
+    Checkpoint files are named `checkpoint_{workflow}_{timestamp}.json` and contain the full execution state: completed tasks, in-progress tasks, pending tasks, and their results. Use `rushti resume --checkpoint <file>` to resume from a specific checkpoint.
+
+---
+
+### [stats]
+
+Controls stats storage for execution history. RushTI supports two backends:
+- `sqlite` (default): local file storage
+- `dynamodb`: AWS DynamoDB tables
+
+Stats storage powers several features: EWMA optimization, the `rushti stats` commands, dashboard visualization, and historical analysis.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable stats storage. When enabled, every run records task-level execution data (timing, status, errors). |
+| `backend` | str | `sqlite` | Storage backend: `sqlite` or `dynamodb`. |
+| `db_path` | str | `data/rushti_stats.db` | SQLite file path (used when `backend = sqlite`). |
+| `dynamodb_region` | str | `` | AWS region for DynamoDB (used when `backend = dynamodb`). |
+| `dynamodb_runs_table` | str | `rushti_runs` | DynamoDB table name for run-level records. |
+| `dynamodb_task_results_table` | str | `rushti_task_results` | DynamoDB table name for task-level records. |
+| `dynamodb_endpoint_url` | str | `` | Optional custom endpoint URL (for local testing tools such as LocalStack). |
+| `retention_days` | int | `90` | Days to keep execution history. Records older than this value are deleted at startup. Valid range: 1-365. Use `0` to keep data indefinitely. |
+
+**Required by:** `[optimization]`, `rushti stats` commands, `rushti stats visualize`
+
+---
+
+## Complete settings.ini Template
+
+Copy this template to `config/settings.ini` and uncomment the settings you want to change:
+
+```ini
+# RushTI Settings Configuration
+# ==============================
+#
+# Settings Precedence (highest to lowest):
+# 1. CLI arguments (e.g., --max-workers 8)
+# 2. JSON task file settings section
+# 3. This settings.ini file
+# 4. Built-in defaults
+
+# ------------------------------------------------------------------------------
+# [defaults] - Common execution settings
+# ------------------------------------------------------------------------------
+[defaults]
+
+# Maximum number of parallel workers
+# Valid range: 1-100 (recommended: start at 4, increase based on TM1 capacity)
+# Default: 4
+# max_workers = 4
+
+# Number of retries for failed process executions
+# Valid range: 0-10
+# Default: 0
+# retries = 0
+
+# Output file path for execution results summary CSV
+# Leave empty or omit to skip creating the summary CSV
+# Default: (empty - no CSV created)
+# result_file = rushti.csv
+
+# Default execution mode for cube reads (--tm1-instance): norm or opt.
+# Cube reads cannot auto-detect the mode; set opt here if most of your
+# cube-stored workflows use explicit predecessors. Ignored for file
+# sources (--tasks), where the mode is auto-detected from file content.
+# Default: norm
+# mode = norm
+
+# ------------------------------------------------------------------------------
+# [optimization] - EWMA tuning parameters for task runtime estimation
+# ------------------------------------------------------------------------------
+[optimization]
+
+# These settings control how the optimizer calculates runtime estimates
+# from historical execution data. They are system-wide and rarely changed.
+#
+# Optimization is activated per-taskfile via:
+#   CLI:  --optimize longest_first  or  --optimize shortest_first
+#   JSON: "optimization_algorithm": "shortest_first" in settings section
+#
+# Requires: [stats] enabled = true (needs historical data for estimates)
+
+# Number of historical runs to analyze for EWMA runtime estimates
+# Valid range: 1-100
+# Default: 10
+# lookback_runs = 10
+
+# Weight historical runs at similar times of day higher
+# Useful for processes with time-varying performance
+# Note: When enabled, caching is disabled (recalculates each run)
+# Default: false
+# time_of_day_weighting = false
+
+# Minimum number of successful samples required before applying optimization
+# Tasks with fewer samples use a default estimate
+# Default: 3
+# min_samples = 3
+
+# Hours to cache optimization data between runs
+# Ignored if time_of_day_weighting is enabled
+# Default: 24
+# cache_duration_hours = 24
+
+# ------------------------------------------------------------------------------
+# [tm1_integration] - TM1 integration for reading taskfiles and logging results
+# ------------------------------------------------------------------------------
+[tm1_integration]
+
+# Push execution results to TM1
+# When enabled, the results CSV is uploaded to TM1 files after each run
+# as: rushti_{workflow}_{run_id}.csv
+#
+# To set up TM1 integration:
+# 1. Run: rushti build --tm1-instance tm1srv01
+#    This creates the required dimensions and cube automatically.
+# 2. Set push_results = true and configure tm1_instance below
+#
+# Default: false
+# push_results = false
+
+# Automatically load results into TM1 cube after push
+# When enabled (and push_results = true), calls }rushti.load.results TI process
+# on the target TM1 instance after uploading the results CSV.
+# The TI process must exist on the target instance.
+#
+# Default: false
+# auto_load_results = false
+
+# Default TM1 instance for reading taskfiles and writing results
+# Must be defined in config.ini
+# tm1_instance = tm1srv01
+
+# DEPRECATED: use tm1_instance above. Honoured indefinitely as the final
+# fallback in the resolution chain; a one-shot DEPRECATION warning fires
+# only when this key is the value actually being used.
+# default_tm1_instance = tm1srv01
+
+# Default cube name for task definitions and results
+# Default: rushti
+# default_rushti_cube = rushti
+
+# Default dimension names (must match the objects created by rushti build)
+# default_workflow_dim = rushti_workflow
+# default_task_id_dim = rushti_task_id
+# default_run_id_dim = rushti_run_id
+# default_measure_dim = rushti_measure
+
+# ------------------------------------------------------------------------------
+# [exclusive_mode] - Prevent concurrent RushTI executions
+# ------------------------------------------------------------------------------
+[exclusive_mode]
+
+# Enable exclusive mode checking by default
+# When enabled, RushTI will check TM1 server sessions for other RushTI instances
+# and wait if an exclusive session is running.
+#
+# Can also be enabled per-taskfile via JSON settings.exclusive or --exclusive flag
+# Default: false
+# enabled = false
+
+# Seconds between checks when waiting for exclusive access
+# Valid range: 5-300
+# Default: 30
+# polling_interval = 30
+
+# Maximum seconds to wait for exclusive access before failing
+# Valid range: 0-3600
+# Default: 600 (10 minutes)
+# timeout = 600
+
+# ------------------------------------------------------------------------------
+# [timeouts] - Run phase time limits (hang detection)
+# ------------------------------------------------------------------------------
+[timeouts]
+
+# Seconds each run phase may take before RushTI treats it as a hang, writes
+# Status = TimedOut to the result file and exits. 0 or empty = no limit.
+# Default: no limit for every phase
+# task_retrieval = 60
+# connection = 60
+# task_execution = 3600
+# push_results = 120
+
+# ------------------------------------------------------------------------------
+# [resume] - Checkpoint and resume feature
+# ------------------------------------------------------------------------------
+[resume]
+
+# Enable checkpoint saving for resume capability
+# Default: false
+# enabled = false
+
+# Seconds between checkpoint saves
+# Valid range: 10-600
+# Default: 60
+# checkpoint_interval = 60
+
+# Directory for checkpoint files
+# Default: ./checkpoints
+# checkpoint_dir = ./checkpoints
+
+# Automatically resume from last checkpoint on startup
+# Default: false
+# auto_resume = false
+
+# ------------------------------------------------------------------------------
+# [stats] - Execution history storage (SQLite or DynamoDB)
+# ------------------------------------------------------------------------------
+[stats]
+
+# Enable the stats database for storing execution history
+# The stats database stores execution statistics for:
+# - Optimization features (EWMA runtime estimation)
+# - TM1 cube logging data source
+# - Historical analysis via 'rushti stats' commands
+# Default: false
+# enabled = false
+
+# Storage backend: sqlite or dynamodb
+# Default: sqlite
+# backend = sqlite
+
+# Path to the SQLite database file
+# Relative paths are resolved from the application directory
+# Default: data/rushti_stats.db
+# db_path = data/rushti_stats.db
+
+# AWS region for DynamoDB backend (required when backend = dynamodb)
+# Example: eu-west-1
+# dynamodb_region = eu-west-1
+
+# DynamoDB runs table name (backend = dynamodb)
+# Default: rushti_runs
+# dynamodb_runs_table = rushti_runs
+
+# DynamoDB task results table name (backend = dynamodb)
+# Default: rushti_task_results
+# dynamodb_task_results_table = rushti_task_results
+
+# Optional custom DynamoDB endpoint URL (for LocalStack/testing)
+# Example: http://localhost:4566
+# dynamodb_endpoint_url =
+
+# Number of days to retain execution history
+# Valid range: 1-365
+# Default: 90
+# retention_days = 90
+```
+
+---
+
+## Environment Variables
+
+One environment variable controls RushTI's root directory for all files:
+
+| Variable | Purpose |
+|----------|---------|
+| `RUSHTI_DIR` | Root directory for all RushTI files. Config files are read from `{RUSHTI_DIR}/config/`, and all output (logs, stats database, checkpoints, archives, visualizations) is written under this directory. |
+
+```bash
+export RUSHTI_DIR=/opt/rushti/prod/
+
+rushti run --tasks daily-etl.json
+# Config:         /opt/rushti/prod/config/config.ini, settings.ini, logging_config.ini
+# Logs:           /opt/rushti/prod/rushti.log
+# Stats DB:       /opt/rushti/prod/data/rushti_stats.db
+# Checkpoints:    /opt/rushti/prod/checkpoints/
+# Archives:       /opt/rushti/prod/archive/{workflow}/{run_id}.json
+# Visualizations: /opt/rushti/prod/visualizations/
+```
+
+---
+
+## Boolean Values
+
+All boolean settings accept the following values (case-insensitive):
+
+| True | False |
+|------|-------|
+| `true`, `yes`, `1`, `on` | `false`, `no`, `0`, `off` |
+
+---
+
+## Validation
+
+RushTI validates all settings at load time:
+
+- **Unknown sections** produce a warning (possible typo) but do not cause failure.
+- **Unknown keys** within known sections produce a warning.
+- **Type mismatches** (e.g., `max_workers = abc`) cause an immediate error.
+- **Out-of-range values** (e.g., `max_workers = 0`) cause an immediate error.
+- **Invalid enum values** (e.g., `level = TRACE`) cause an immediate error.
+
+---
+
+## Next Steps
+
+- **[CLI Reference](cli-reference.md)** -- Command-line options that override these settings
+- **[Advanced Task Files](advanced-task-files.md)** -- JSON task file settings section

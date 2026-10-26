@@ -1,0 +1,62 @@
+{
+  "metadata": {
+    "author": "",
+    "description": "Contention-aware optimized: driver=pCube, chain=[Sales], sensitivity=1.5, recommended_workers=2",
+    "name": "",
+    "workflow": "snapshot-fixture"
+  },
+  "settings": {
+    "max_workers": 2
+  },
+  "tasks": [
+    {
+      "id": "1",
+      "instance": "tm1srv01",
+      "parameters": {
+        "pCube": "Sales",
+        "pYear": "2024"
+      },
+      "process": "}bedrock.cube.data.copy"
+    },
+    {
+      "id": "2",
+      "instance": "tm1srv01",
+      "parameters": {
+        "pCube": "Sales",
+        "pYear": "2025"
+      },
+      "predecessors": [
+        "1"
+      ],
+      "process": "}bedrock.cube.data.copy"
+    },
+    {
+      "id": "3",
+      "instance": "tm1srv01",
+      "parameters": {
+        "pCube": "Inventory",
+        "pYear": "2024"
+      },
+      "process": "}bedrock.cube.data.copy"
+    },
+    {
+      "id": "4",
+      "instance": "tm1srv01",
+      "parameters": {
+        "pCube": "Inventory",
+        "pYear": "2025"
+      },
+      "process": "}bedrock.cube.data.copy"
+    },
+    {
+      "id": "5",
+      "instance": "tm1srv01",
+      "parameters": {
+        "pCube": "Forecast",
+        "pYear": "2025"
+      },
+      "process": "}bedrock.cube.data.copy"
+    }
+  ],
+  "version": "2.0"
+}
